@@ -61,6 +61,15 @@ class VecEnv(ABC):
             Tuple[torch.Tensor, dict]: Tuple containing the observations and extras.
         """
         raise NotImplementedError
+    
+    @abstractmethod
+    def get_privileged_observations(self) -> tuple[torch.Tensor, dict]:
+        """Return the current privileged observations.
+
+        Returns:
+            Tuple[torch.Tensor, dict]: Tuple containing the observations and extras.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def reset(self) -> tuple[torch.Tensor, dict]:

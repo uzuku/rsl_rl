@@ -9,14 +9,18 @@ import torch.optim as optim
 
 from rsl_rl.modules import ActorCritic
 from rsl_rl.storage import RolloutStorage
+from rsl_rl.storage.replay_buffer import ReplayBuffer
 
 
-class PPO:
+class AMPPPO:
     actor_critic: ActorCritic
 
     def __init__(
         self,
         actor_critic,
+        discriminator,
+        amp_data,
+        amp_normalizer,
         num_learning_epochs=1,
         num_mini_batches=1,
         clip_param=0.2,
@@ -30,18 +34,36 @@ class PPO:
         schedule="fixed",
         desired_kl=0.01,
         device="cpu",
+        amp_replay_buffer_size=100000,
+        min_std=None,
     ):
         self.device = device
 
         self.desired_kl = desired_kl
         self.schedule = schedule
         self.learning_rate = learning_rate
+        self.min_std = min_std
+
+         # Discriminator components
+        self.discriminator = discriminator
+        self.discriminator.to(self.device)
+        self.amp_data = amp_data
+        self.amp_storage = ReplayBuffer(amp_data.observation_dim, amp_data.amp_traj_length, amp_replay_buffer_size, device)
+        self.amp_normalizer = amp_normalizer
 
         # PPO components
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
         self.storage = None  # initialized later
-        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
+
+        # Optimizer for policy and discriminator.
+        params = [
+            {'params': self.actor_critic.parameters(), 'name': 'actor_critic'},
+            {'params': self.discriminator.trunk.parameters(),
+             'weight_decay': 10e-4, 'name': 'amp_trunk'},
+            {'params': self.discriminator.amp_linear.parameters(),
+             'weight_decay': 10e-2, 'name': 'amp_head'}]
+        self.optimizer = optim.Adam(params, lr=learning_rate)
         self.transition = RolloutStorage.Transition()
 
         # PPO parameters
@@ -80,7 +102,7 @@ class PPO:
         self.transition.critic_observations = critic_obs.clone()
         return self.transition.actions
 
-    def process_env_step(self, rewards, dones, infos, next_obs, next_critic_obs):
+    def process_env_step(self, rewards, dones, infos, next_obs, next_critic_obs, amp_traj):
         self.transition.next_observations = next_obs.clone()
         self.transition.next_critic_observations = next_critic_obs.clone()
         self.transition.rewards = rewards.clone()
@@ -90,6 +112,9 @@ class PPO:
             self.transition.rewards += self.gamma * torch.squeeze(
                 self.transition.values * infos["time_outs"].unsqueeze(1).to(self.device), 1
             )
+
+        not_done_idx = (dones==False).nonzero().squeeze()
+        self.amp_storage.insert(amp_traj)
 
         # Record the transition
         self.storage.add_transitions(self.transition)
@@ -103,11 +128,22 @@ class PPO:
     def update(self):
         mean_value_loss = 0
         mean_surrogate_loss = 0
+        mean_amp_loss = 0
+        mean_grad_pen_loss = 0
+        mean_policy_pred = 0 
+        mean_expert_pred = 0
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
-        for (
+        amp_policy_generator = self.amp_storage.feed_forward_generator(self.num_learning_epochs * self.num_mini_batches,
+            self.storage.num_envs * self.storage.num_transitions_per_env // self.num_mini_batches)
+        amp_expert_generator = self.amp_data.feed_forward_generator(self.num_learning_epochs * self.num_mini_batches,
+            self.storage.num_envs * self.storage.num_transitions_per_env // self.num_mini_batches)
+        
+        for sample, sample_amp_policy, sample_amp_expert in zip(generator, amp_policy_generator, amp_expert_generator):
+
+            (
             obs_batch,
             critic_obs_batch,
             actions_batch,
@@ -121,7 +157,8 @@ class PPO:
             old_sigma_batch,
             hid_states_batch,
             masks_batch,
-        ) in generator:
+            ) = sample
+
             self.actor_critic.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
             value_batch = self.actor_critic.evaluate(
@@ -170,7 +207,22 @@ class PPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            # Discriminator loss.
+            if self.amp_normalizer is not None:
+                with torch.no_grad():
+                    _sample_amp_policy = self.amp_normalizer.normalize_torch(sample_amp_policy, self.device)
+                    _sample_amp_expert = self.amp_normalizer.normalize_torch(sample_amp_expert, self.device)
+                   
+            policy_d = self.discriminator(_sample_amp_policy)
+            expert_d = self.discriminator(_sample_amp_expert)
+            expert_loss = torch.nn.MSELoss()(expert_d, torch.ones(expert_d.size(), device=self.device))
+            policy_loss = torch.nn.MSELoss()(policy_d, -1 * torch.ones(policy_d.size(), device=self.device))
+            amp_loss = 0.5 * (expert_loss + policy_loss)
+            grad_pen_loss = self.discriminator.compute_grad_pen(_sample_amp_expert, lambda_=10)
+            disc_logit_loss = self.discriminator.compute_disc_logit_reg(disc_logit_reg=0.01)
+            
+            # Compute total loss
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + amp_loss + grad_pen_loss + disc_logit_loss
 
             # Gradient step
             self.optimizer.zero_grad()
@@ -178,12 +230,25 @@ class PPO:
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
 
+            if self.amp_normalizer is not None:
+                    self.amp_normalizer.update(sample_amp_policy.detach().cpu().numpy())
+                    self.amp_normalizer.update(sample_amp_expert.detach().cpu().numpy())
+
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
+            mean_amp_loss += amp_loss.item()
+            mean_grad_pen_loss += grad_pen_loss.item()
+            mean_policy_pred += policy_d.mean().item()
+            mean_expert_pred += expert_d.mean().item()
+
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
+        mean_amp_loss /= num_updates
+        mean_grad_pen_loss /= num_updates
+        mean_policy_pred /= num_updates
+        mean_expert_pred /= num_updates
         self.storage.clear()
 
-        return mean_value_loss, mean_surrogate_loss
+        return mean_value_loss, mean_surrogate_loss, mean_amp_loss, mean_grad_pen_loss, mean_policy_pred, mean_expert_pred
